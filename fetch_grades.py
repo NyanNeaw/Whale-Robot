@@ -24,6 +24,7 @@ import argparse
 import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,6 +38,7 @@ TIMEOUT = 10  # seconds per request
 FAST_DELAY = (3, 6)  # random jitter between retries
 SLOW_AFTER = 120  # seconds of continuous failure before slowing down
 SLOW_DELAY = 15
+MAX_WORKERS = 5  # upper bound on parallel attempts
 
 # The server reports login problems by emitting a call to one of these JS
 # functions in the response. The modal texts themselves are always in the
@@ -132,34 +134,65 @@ def main():
     ap.add_argument("--out", default="grades.html", help="output file (default: %(default)s)")
     ap.add_argument("--give-up-after", type=float, metavar="MIN",
                     help="stop retrying after this many minutes (default: never)")
+    ap.add_argument("--workers", type=int, default=3, metavar="N",
+                    help=f"parallel attempts, 1-{MAX_WORKERS} (default: %(default)s)")
     args = ap.parse_args()
+    workers = max(1, min(args.workers, MAX_WORKERS))
 
     sid, bday = get_credentials()
-    session = requests.Session()
-    session.headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) grades-fetch/1.0"
-
     started = time.monotonic()
-    n = 0
-    try:
-        while True:
+    stop = threading.Event()
+    lock = threading.Lock()
+    result = {}  # "page" on success, "error" on a reason to abort
+
+    def worker(wid):
+        # One Session per worker: each needs its own cookies/ViewState.
+        session = requests.Session()
+        session.headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) grades-fetch/1.0"
+        n = 0
+        while not stop.is_set():
             n += 1
             try:
                 page = attempt(session, sid, bday, args.term)
             except LoginRejected as e:
-                sys.exit(f"Login rejected by the site: {e}. Check .env; not retrying.")
+                with lock:
+                    result.setdefault("error", f"Login rejected by the site: {e}. Check .env; not retrying.")
+                stop.set()
+                return
             except AttemptFailed as e:
                 elapsed = time.monotonic() - started
                 if args.give_up_after and elapsed > args.give_up_after * 60:
-                    sys.exit(f"Giving up after {elapsed:.0f}s and {n} attempts: {e}")
+                    with lock:
+                        result.setdefault("error", f"Giving up after {elapsed:.0f}s: {e}")
+                    stop.set()
+                    return
                 delay = SLOW_DELAY if elapsed >= SLOW_AFTER else random.uniform(*FAST_DELAY)
-                print(f"[attempt {n}, {elapsed:.0f}s] {e} -- retrying in {delay:.1f}s", file=sys.stderr)
-                time.sleep(delay)
+                print(f"[w{wid} attempt {n}, {elapsed:.0f}s] {e} -- retrying in {delay:.1f}s", file=sys.stderr)
+                stop.wait(delay)
                 continue
-            Path(args.out).write_bytes(page)
-            print(f"Saved {args.term} to {args.out} ({len(page)} bytes) after {n} attempt(s)")
+            with lock:
+                if "page" not in result:
+                    result["page"] = page
+                    result["who"] = f"w{wid} attempt {n}"
+            stop.set()
             return
+
+    threads = [threading.Thread(target=worker, args=(i + 1,), daemon=True) for i in range(workers)]
+    for t in threads:
+        t.start()
+    try:
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(timeout=0.5)
     except KeyboardInterrupt:
+        stop.set()
         sys.exit("\nInterrupted.")
+
+    if "page" in result:
+        Path(args.out).write_bytes(result["page"])
+        print(f"Saved {args.term} to {args.out} ({len(result['page'])} bytes) via {result['who']}")
+    else:
+        sys.exit(result.get("error", "Stopped without a result."))
 
 
 if __name__ == "__main__":
