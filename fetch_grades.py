@@ -35,9 +35,10 @@ from bs4 import BeautifulSoup
 URL = "https://www.dograde.online/loeipit/default.aspx"
 HIDDEN_FIELDS = ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION")
 TIMEOUT = 10  # seconds per request
-FAST_DELAY = (3, 6)  # random jitter between retries
+FAST_DELAY = (1, 2)  # random jitter between retries
 SLOW_AFTER = 120  # seconds of continuous failure before slowing down
-SLOW_DELAY = 15
+SLOW_DELAY = 5
+MIN_DELAY = 1  # floor for any retry delay, whatever the flags say
 MAX_WORKERS = 5  # upper bound on parallel attempts
 
 # The server reports login problems by emitting a call to one of these JS
@@ -136,8 +137,15 @@ def main():
                     help="stop retrying after this many minutes (default: never)")
     ap.add_argument("--workers", type=int, default=3, metavar="N",
                     help=f"parallel attempts, 1-{MAX_WORKERS} (default: %(default)s)")
+    ap.add_argument("--delay", type=float, nargs=2, default=FAST_DELAY, metavar=("MIN", "MAX"),
+                    help="random retry delay range in seconds (default: %(default)s)")
+    ap.add_argument("--slow-delay", type=float, default=SLOW_DELAY, metavar="SEC",
+                    help=f"retry delay after {SLOW_AFTER}s of failures (default: %(default)s)")
     args = ap.parse_args()
     workers = max(1, min(args.workers, MAX_WORKERS))
+    lo, hi = sorted(max(MIN_DELAY, d) for d in args.delay)
+    fast_delay = (lo, hi)
+    slow_delay = max(MIN_DELAY, args.slow_delay)
 
     sid, bday = get_credentials()
     started = time.monotonic()
@@ -166,7 +174,7 @@ def main():
                         result.setdefault("error", f"Giving up after {elapsed:.0f}s: {e}")
                     stop.set()
                     return
-                delay = SLOW_DELAY if elapsed >= SLOW_AFTER else random.uniform(*FAST_DELAY)
+                delay = slow_delay if elapsed >= SLOW_AFTER else random.uniform(*fast_delay)
                 print(f"[w{wid} attempt {n}, {elapsed:.0f}s] {e} -- retrying in {delay:.1f}s", file=sys.stderr)
                 stop.wait(delay)
                 continue
